@@ -71,7 +71,8 @@ Mental model: steven is the General Manager. He wants to talk to one thing — a
 │  │   Supervisor                       │  │
 │  │   ├── seq counter (in-mem)         │  │
 │  │   ├── In-Memory Bus (EventEmitter) │  │
-│  │   └── SQLite write queue (50ms)    │  │
+│  │   ├── SQLite write queue (50ms)    │  │
+│  │   └── Workspace provisioner        │  │
 │  └────────────────────────────────────┘  │
 │  ┌────────────────────────────────────┐  │
 │  │   Workers (one process per type)   │  │
@@ -84,12 +85,12 @@ Mental model: steven is the General Manager. He wants to talk to one thing — a
 │  │   exposed to KM workers            │  │
 │  └────────────────────────────────────┘  │
 └──────────────────────────────────────────┘
-                    │
-                    ▼
-              ┌──────────┐
-              │ SQLite   │
-              │ (WAL)    │
-              └──────────┘
+              │              │
+              ▼              ▼
+       ┌──────────┐   ┌─────────────────────┐
+       │ SQLite   │   │ ~/kitchen/workspaces │
+       │ (WAL)    │   │   <worker>/<run>/    │
+       └──────────┘   └─────────────────────┘
 ```
 
 **Key invariants:**
@@ -140,8 +141,12 @@ interface Worker {
 interface TaskSpec {
   prompt: string;
   context?: Record<string, unknown>;  // worker-type-specific overrides
-  cwd?: string;
+  cwd?: string;                       // overridden by workspace if workspace.kind != "inherit"
   model?: string;
+  workspace?:                         // see §12 Workspaces; defaults to { kind: "fresh" }
+    | { kind: "fresh" }
+    | { kind: "worktree"; repo: string; base?: string }
+    | { kind: "inherit" };
 }
 ```
 
@@ -222,12 +227,15 @@ CREATE INDEX idx_events_type   ON events(type, seq);
 
 -- Run summaries. Materialized for cheap "list runs" queries; rebuildable from events.
 CREATE TABLE runs (
-    id            TEXT PRIMARY KEY,
-    worker_id     TEXT NOT NULL REFERENCES workers(id),
-    started_at_ms INTEGER NOT NULL,
-    ended_at_ms   INTEGER,
-    state         TEXT NOT NULL,
-    task_summary  TEXT
+    id                     TEXT PRIMARY KEY,
+    worker_id              TEXT NOT NULL REFERENCES workers(id),
+    started_at_ms          INTEGER NOT NULL,
+    ended_at_ms            INTEGER,
+    state                  TEXT NOT NULL,
+    task_summary           TEXT,
+    workspace_path         TEXT,                              -- absolute path; null if kind=inherit
+    workspace_kind         TEXT,                              -- 'fresh' | 'worktree' | 'inherit'
+    workspace_archived_at  INTEGER                            -- soft delete
 );
 CREATE INDEX idx_runs_worker ON runs(worker_id, started_at_ms DESC);
 
@@ -318,6 +326,12 @@ GET    /v1/events?worker_id=&run_id=&since_seq=&limit=
 
 # KM
 POST   /v1/km/ask                        { question, to? } → streams answer
+
+# Workspaces (see §12)
+GET    /v1/runs/:id/workspace                          → { path, kind, exists, archivedAt? }
+GET    /v1/workspaces?worker_id=&include_archived=     → workspace list
+POST   /v1/runs/:id/workspace/archive                  → soft delete
+DELETE /v1/runs/:id/workspace                          → hard delete (rm -rf)
 
 # System
 GET    /v1/health
@@ -474,9 +488,87 @@ Auth: `OPENAI_API_KEY` or ChatGPT browser auth. Shared across workers.
 
 ---
 
-## 12. Frontends
+## 12. Workspaces ("Departments")
 
-### 12.1 TUI (`kitchen tui`)
+Each run gets an isolated working directory. Default behavior — **not opt-in.** Without this, parallel workers operating on the same repo collide on git state and on disk.
+
+### 12.1 Layout
+
+```
+<workspace_root>/                # default ~/kitchen/workspaces, configurable via system_config
+└── <worker_id>/
+    └── <run_id>/                # provisioned on run.started, set as worker's cwd
+        ├── .kitchen/            # run metadata
+        │   ├── task.json        # TaskSpec snapshot
+        │   ├── run.json         # { runId, workerId, startedAtMs, kind }
+        │   └── workspace.json   # { kind, repo?, base?, ... }
+        └── <worker output>      # whatever the worker writes
+```
+
+### 12.2 Workspace kinds
+
+```typescript
+type Workspace =
+  | { kind: "fresh" }                                     // empty subdir; default
+  | { kind: "worktree"; repo: string; base?: string }     // git worktree from base branch
+  | { kind: "inherit" };                                  // no workspace; use TaskSpec.cwd or worker default
+```
+
+- **`fresh`** (default). Empty subdir. Worker's cwd is set to it. For tasks that produce artifacts but don't need a repo context.
+- **`worktree`**. Provisioned via `git worktree add <workspace_path> <base>`. `base` defaults to the repo's `HEAD` at run.started time; can be overridden per-task. Worker config can set `defaultBaseBranch` (e.g. `main`) which overrides HEAD when the per-task `base` is unset. On run.ended, worktree is left in place (manual prune later).
+- **`inherit`**. No workspace dir provisioned. Worker uses `TaskSpec.cwd` or `WorkerConfig.cwd`. Escape hatch for "I want this run to operate on my actual repo, no isolation."
+
+### 12.3 Lifecycle
+
+- **Created** by Supervisor on `run.started`, before `worker.start()` is called. Path stored in `runs.workspace_path`.
+- **Persists** after `run.ended`. Artifacts preserved for review.
+- **Soft archive**: `POST /v1/runs/:id/workspace/archive` sets `workspace_archived_at`. Worktrees: also runs `git worktree remove --force` so git's worktree list stays clean; the disk path is left.
+- **Hard delete**: `DELETE /v1/runs/:id/workspace` does `rm -rf` (and `git worktree remove` first if applicable).
+- **`kitchen workspace prune`** CLI: bulk hard-delete archived workspaces; flag `--include-active` for archived-or-not.
+- **Cascade**: archiving a worker soft-archives all its workspaces. Hard-deleting a worker prompts to hard-delete its workspaces too.
+
+### 12.4 Supervisor responsibility
+
+Workers don't know workspaces exist. The Supervisor:
+
+1. On `start()` request, resolves `TaskSpec.workspace` (defaulting to `{ kind: "fresh" }`).
+2. Provisions the directory:
+   - `fresh`: `mkdir -p <root>/<worker_id>/<run_id>`
+   - `worktree`: `mkdir -p` parent, then `git -C <repo> worktree add <path> <base-or-HEAD>`
+   - `inherit`: no-op
+3. Writes `.kitchen/task.json`, `.kitchen/run.json`, `.kitchen/workspace.json`.
+4. Sets `runs.workspace_path` and `runs.workspace_kind`.
+5. Calls `worker.start({ ...task, cwd: workspacePath })`. The worker just sees a cwd.
+
+This keeps Worker implementations clean — no workspace logic per worker type.
+
+### 12.5 Frontend integration
+
+- **TUI**: on a run's detail view, `Ctrl+W` opens `workspace_path` in `$EDITOR`; show path inline.
+- **macOS**: "Show in Finder" button on run detail.
+- **KM**: `get_worker(id)` response includes `currentRun.workspacePath`. Useful for "where did this work happen?" questions.
+
+### 12.6 Worktree edge cases (acknowledge, defer mitigation)
+
+- **Stale worktrees** if Supervisor crashes mid-provision. Mitigation: on boot, scan `runs.workspace_path` for orphaned worktrees and `git worktree prune`.
+- **Concurrent worktrees on the same repo**: each on its own branch is fine; clobbering the same branch from two runs is undefined. v1: workspace allocates a fresh branch name per run (`kitchen/<worker_id>/<run_id>`) so collisions are impossible.
+- **Repo not a git repo / dirty repo**: `worktree` kind fails fast with a clear error event; user falls back to `fresh` or `inherit`.
+
+### 12.7 Schema
+
+`runs.workspace_path` (TEXT, nullable), `runs.workspace_kind` (TEXT, nullable), `runs.workspace_archived_at` (INTEGER, nullable). Already in §7.
+
+`system_config.workspace_root` seeded at bootstrap to `~/kitchen/workspaces`.
+
+### 12.8 API
+
+See §9.1 — four endpoints.
+
+---
+
+## 13. Frontends
+
+### 13.1 TUI (`kitchen tui`)
 
 - Ink + React, ships in same binary as daemon and CLI.
 - Worker list pane (left), sorted by `attentionRequired DESC, attentionSinceMs ASC, lastEventAtMs DESC`.
@@ -485,7 +577,7 @@ Auth: `OPENAI_API_KEY` or ChatGPT browser auth. Shared across workers.
 - `Ctrl+I` interrupt, `Ctrl+K` kill.
 - Tab to swap between workers; ESC returns to list.
 
-### 12.2 macOS app
+### 13.2 macOS app
 
 - SwiftUI native, distributed as `.dmg` via homebrew cask.
 - Sidebar: worker list (same sort).
@@ -494,17 +586,18 @@ Auth: `OPENAI_API_KEY` or ChatGPT browser auth. Shared across workers.
 - Worker creation/config UI is **not** in v1 (CLI only — config-heavy form, low frequency).
 - `notify_user` events are subscribed but not surfaced as macOS notifications in v1 (defer).
 
-### 12.3 CLI
+### 13.3 CLI
 
 - `kitchen daemon start | stop | status` — explicit control.
 - Auto-spawn: `kitchen ask` and `kitchen tui` spawn the daemon if not running.
 - `kitchen ask "<q>" [--to <id>]` — KM query.
 - `kitchen tui` — launch TUI.
 - `kitchen workers list | create | archive` — minimal worker management.
+- `kitchen workspace list | prune | open <run_id>` — workspace management.
 
 ---
 
-## 13. v1 Scope Summary
+## 14. v1 Scope Summary
 
 ### IN v1
 
@@ -512,6 +605,7 @@ Auth: `OPENAI_API_KEY` or ChatGPT browser auth. Shared across workers.
 - Kitchen MCP server (in-process)
 - ClaudeCodeWorker
 - CodexWorker
+- Per-run workspaces (fresh + git worktree + inherit kinds), default `fresh`
 - TUI with full controls
 - macOS app with full input parity (excluding worker creation UI)
 - Default KM bootstrap (Claude type) with `kitchen ask` CLI
@@ -537,15 +631,17 @@ Each step ends with a working demo.
 
 1. **Foundations**: schema + bus + Supervisor + WS subscription mechanics
 2. **HTTP API**: CRUD + dispatch endpoints
-3. **ClaudeCodeWorker**: proves Worker shape; first end-to-end flow
-4. **TUI v1**: proves live-stream UX (steven has a usable product here)
-5. **KM bootstrap + kitchen MCP server + `kitchen ask`**: design-goal #4 satisfied
-6. **CodexWorker**: proves abstraction across two SDKs
-7. **macOS app v1**: design-goal #3 satisfied; v1 done
+3. **Workspaces (Supervisor side)**: provision `fresh` + `inherit` kinds; cwd plumbing into Worker.start()
+4. **ClaudeCodeWorker**: proves Worker shape; first end-to-end flow with workspace cwd
+5. **TUI v1**: proves live-stream UX (steven has a usable product here)
+6. **Workspaces — git worktree kind**: layered onto step 3
+7. **KM bootstrap + kitchen MCP server + `kitchen ask`**: design-goal #4 satisfied
+8. **CodexWorker**: proves abstraction across two SDKs
+9. **macOS app v1**: design-goal #3 satisfied; v1 done
 
 ---
 
-## 14. Open Items / v1.1 Backlog
+## 15. Open Items / v1.1 Backlog
 
 Captured here so they don't get lost:
 
@@ -559,11 +655,16 @@ Captured here so they don't get lost:
 - `dispatch_worker` MCP tool (programmatic dispatch)
 - "Snooze worker" affordance to suppress over-reporting on intentionally-paused workers
 - Per-KM topical scopes (e.g., `kitchen ask --to docs-km`)
+- Workspace merge-back flow (turn a worktree's branch into a PR or merge-to-base)
+- Workspace size/disk-usage reporting and quota warnings
+- Auto-archive policy for workspaces (e.g., archive after N days post-run.ended)
 
-## 15. Known Acceptable Risks (v1)
+## 16. Known Acceptable Risks (v1)
 
 - **Crash loses ≤50ms of un-flushed events.** Live subscribers saw them; durable history is missing them. Acceptable for personal tool.
 - **Over-reporting on intentionally-paused workers.** A worker paused for legit reasons (you're thinking) shows as needing attention. Mitigation deferred (snooze affordance, paused substate).
 - **macOS app cannot create workers.** CLI-only for v1. Acceptable for first ship.
 - **No FTS5.** `search_events` is LIKE-based; slow on large logs. Add FTS5 if KM searches become slow.
 - **No persistent KM context.** Each `kitchen ask` invocation starts fresh. Acceptable trade-off vs token burn.
+- **Workspaces accumulate disk usage.** No auto-prune; manual `kitchen workspace prune`. Worktree branches accumulate too. Acceptable until disk pressure shows up.
+- **Stale worktrees on Supervisor crash mid-provision.** Boot-time `git worktree prune` covers the common case; pathological cases require manual cleanup.
