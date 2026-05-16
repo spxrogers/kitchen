@@ -1,8 +1,21 @@
+<table align="center">
+  <tr>
+    <td align="center">
+      <h2>🚫 Abandoned</h2>
+      <p><strong>Planned to build this in April — but Anthropic just shipped it as a first-class feature in Claude Code.</strong></p>
+      <p>See <a href="https://code.claude.com/docs/en/agent-view"><strong>Agent View</strong></a> in the Claude Code docs.</p>
+      <p><sub>The design notes below are preserved for posterity.</sub></p>
+    </td>
+  </tr>
+</table>
+
+---
+
 # kitchen
 
 A personal tool for orchestrating parallel coding-agent sessions.
 
-> **Status:** design phase. The v1 spec lives at [`docs/superpowers/specs/2026-04-29-kitchen-design.md`](docs/superpowers/specs/2026-04-29-kitchen-design.md). No implementation yet.
+> **Status:** abandoned (see banner above). The v1 spec lives at [`docs/superpowers/specs/2026-04-29-kitchen-design.md`](docs/superpowers/specs/2026-04-29-kitchen-design.md). No implementation.
 
 ## A note on the metaphor
 
