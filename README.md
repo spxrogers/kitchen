@@ -2,7 +2,7 @@
   <tr>
     <td align="center">
       <h2>🚫 Abandoned</h2>
-      <p><strong>Planned to build this — but Anthropic just shipped it as a first-class feature in Claude Code.</strong></p>
+      <p><strong>Planned to build this <em>in April</em> — but Anthropic just shipped it as a first-class feature in Claude Code.</strong></p>
       <p>See <a href="https://code.claude.com/docs/en/agent-view"><strong>Agent View</strong></a> in the Claude Code docs.</p>
       <p><sub>The design notes below are preserved for posterity.</sub></p>
     </td>
