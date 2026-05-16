@@ -4,6 +4,12 @@ A personal tool for orchestrating parallel coding-agent sessions.
 
 > **Status:** design phase. The v1 spec lives at [`docs/superpowers/specs/2026-04-29-kitchen-design.md`](docs/superpowers/specs/2026-04-29-kitchen-design.md). No implementation yet.
 
+## A note on the metaphor
+
+The naming throughout this project leans on a restaurant-kitchen analogy: you are the **General Manager**, you talk to a **Kitchen Manager** who coordinates the line, and the actual work happens in **Workers** assigned to isolated **departments** (the stations of a kitchen — grill, pastry, salad, etc.). "Dropping in" to a worker is the GM walking the kitchen floor to watch a station live.
+
+It's a loose, evocative metaphor — not a domain model. Don't read too much into it. It picks up where the cooking analogy stops being useful (e.g., workers don't have shifts, departments don't share ovens). If a future term ever forces the metaphor, prefer the clearer term over the cute one.
+
 ## What it solves
 
 Running multiple Claude Code and Codex sessions in parallel across different repos and projects gets unwieldy fast. The pain isn't typing into tabs — it's:
