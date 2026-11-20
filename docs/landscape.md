@@ -8,6 +8,7 @@ Supporting material on this branch:
 - Full report, with citations: [`reports/Open source coding agent harnesses.md`](../reports/Open%20source%20coding%20agent%20harnesses.md)
 - Per-topic research notes: [`research_notes/Open source coding agent harnesses/`](../research_notes/Open%20source%20coding%20agent%20harnesses/)
 - Original v1 spec (shelved): [`docs/superpowers/specs/2026-04-29-kitchen-design.md`](superpowers/specs/2026-04-29-kitchen-design.md)
+- Hands-on findings with Claude Code cloud sessions as a Kitchen Manager (2026-11-20): [`docs/cloud-sessions.md`](cloud-sessions.md)
 
 The original report was written before Paperclip and OpenRig were found. Where this page and the report disagree, this page is the newer view.
 
